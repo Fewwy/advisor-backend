@@ -401,7 +401,7 @@ class KafkaDispatcher(object):
             import telemetry
             from opentelemetry.trace import SpanKind
             tracer = telemetry.get_tracer("advisor-kafka")
-            extracted_ctx = telemetry.extract_kafka_headers_to_context(headers)
+            extracted_ctx = telemetry.extract_kafka_headers_to_context(headers) if tracer else None
         except Exception:
             tracer = None
             extracted_ctx = None

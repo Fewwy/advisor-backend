@@ -476,3 +476,71 @@ class TestTelemetryPerformanceAndOptimization(SimpleTestCase):
         # Ratio of 100 items to 10 items should be approximately linear (~10x, definitely < 25x)
         scaling_ratio = time_100 / max(time_10, 1e-6)
         self.assertLess(scaling_ratio, 25.0, f"Non-linear scaling detected: {scaling_ratio:.2f}x for 10x data")
+
+
+class TestReviewCommentsIssues(SimpleTestCase):
+    """
+    Test suite reproducing the four review comment findings.
+    """
+
+    def test_comment1_init_telemetry_force_reinit_replaces_provider(self):
+        """
+        Comment 1: Verifies that init_telemetry(force_reinit=True) successfully
+        overrides the TracerProvider across process forks without being blocked.
+        """
+        if not OTEL_AVAILABLE:
+            self.skipTest("OpenTelemetry packages not installed yet")
+        from opentelemetry import trace
+        os.environ["OTEL_ENABLED"] = "true"
+
+        telemetry.init_telemetry(service_name="first-service", force_reinit=True)
+        first_provider = trace.get_tracer_provider()
+
+        telemetry.init_telemetry(service_name="second-service", force_reinit=True)
+        second_provider = trace.get_tracer_provider()
+
+        # Must successfully replace the provider instance
+        self.assertIsNot(first_provider, second_provider)
+
+    def test_comment2_shutdown_telemetry_invokes_provider_methods(self):
+        """
+        Comment 2: Verifies that telemetry.shutdown_telemetry() directly calls
+        force_flush and shutdown on the active TracerProvider.
+        """
+        from unittest.mock import MagicMock, patch
+
+        mock_provider = MagicMock()
+        with patch("opentelemetry.trace.get_tracer_provider", return_value=mock_provider):
+            telemetry._IS_INITIALIZED = True
+            telemetry.shutdown_telemetry(timeout_millis=5000)
+
+            mock_provider.force_flush.assert_called_once_with(timeout_millis=5000)
+            mock_provider.shutdown.assert_called_once()
+
+    def test_comment3_shutdown_telemetry_resets_initialized_state(self):
+        """
+        Comment 3: Verifies that shutdown_telemetry() resets _IS_INITIALIZED to False
+        and _INITIALIZED_PID to None so subsequent initializations are not blocked.
+        """
+        from unittest.mock import MagicMock, patch
+
+        with patch("opentelemetry.trace.get_tracer_provider", return_value=MagicMock()):
+            telemetry._IS_INITIALIZED = True
+            telemetry._INITIALIZED_PID = os.getpid()
+
+            telemetry.shutdown_telemetry()
+
+            # Must reset state
+            self.assertFalse(telemetry._IS_INITIALIZED)
+            self.assertIsNone(telemetry._INITIALIZED_PID)
+
+    def test_comment4_get_tracer_returns_none_when_uninitialized(self):
+        """
+        Comment 4: Verifies that get_tracer() returns None when telemetry is disabled/uninitialized,
+        preventing dormant no-op tracing overhead in message handlers.
+        """
+        telemetry._IS_INITIALIZED = False
+        tracer = telemetry.get_tracer("advisor-kafka")
+
+        # Must return None so callers like kafka_utils skip tracing overhead entirely
+        self.assertIsNone(tracer)

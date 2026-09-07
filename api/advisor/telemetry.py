@@ -229,6 +229,8 @@ def init_telemetry(
         export_timeout_millis=int(os.getenv("OTEL_BSP_EXPORT_TIMEOUT", "10000")),
     )
     provider.add_span_processor(bsp)
+    if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
+        trace._TRACER_PROVIDER_SET_ONCE._done = False
     trace.set_tracer_provider(provider)
 
     try:
@@ -261,6 +263,9 @@ def init_telemetry(
 
 
 def get_tracer(name: str = "advisor"):
+    """Return tracer only if OpenTelemetry is initialized and enabled."""
+    if not _IS_INITIALIZED:
+        return None
     try:
         from opentelemetry import trace
         return trace.get_tracer(name)
@@ -290,6 +295,7 @@ def shutdown_telemetry(timeout_millis: int = 5000) -> None:
     Flush all buffered spans and cleanly shut down TracerProvider.
     Ensures queued spans in BatchSpanProcessor are exported prior to process exit.
     """
+    global _IS_INITIALIZED, _INITIALIZED_PID
     if not _IS_INITIALIZED:
         return
     try:
@@ -299,6 +305,8 @@ def shutdown_telemetry(timeout_millis: int = 5000) -> None:
             provider.force_flush(timeout_millis=timeout_millis)
         if hasattr(provider, "shutdown"):
             provider.shutdown()
+        _IS_INITIALIZED = False
+        _INITIALIZED_PID = None
         logger.info("OpenTelemetry telemetry flushed and shut down successfully.")
     except Exception as e:
         logger.warning("Error flushing OpenTelemetry spans on shutdown: %s", e)

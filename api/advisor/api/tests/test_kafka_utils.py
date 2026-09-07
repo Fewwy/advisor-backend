@@ -361,6 +361,7 @@ class TestKafkaUtils(TestCase):
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import SimpleSpanProcessor
             from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+            import telemetry
         except ImportError:
             self.skipTest("OpenTelemetry dependencies not installed yet")
 
@@ -370,6 +371,7 @@ class TestKafkaUtils(TestCase):
         if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
             trace._TRACER_PROVIDER_SET_ONCE._done = False
         trace.set_tracer_provider(provider)
+        telemetry._IS_INITIALIZED = True
 
         trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
         span_id = "00f067aa0ba902b7"
@@ -394,6 +396,7 @@ class TestKafkaUtils(TestCase):
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import SimpleSpanProcessor
             from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+            import telemetry
         except ImportError:
             self.skipTest("OpenTelemetry dependencies not installed yet")
 
@@ -403,6 +406,7 @@ class TestKafkaUtils(TestCase):
         if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
             trace._TRACER_PROVIDER_SET_ONCE._done = False
         trace.set_tracer_provider(provider)
+        telemetry._IS_INITIALIZED = True
 
         trace_1 = "4bf92f3577b34da6a3ce929d0e0e4736"
         trace_2 = "6cf92f3577b34da6a3ce929d0e0e4799"
@@ -466,3 +470,36 @@ class TestKafkaUtils(TestCase):
         total_messages = iterations * 20
         rate = total_messages / duration
         self.assertGreater(rate, 5000, f"Batch dispatch throughput too low: {rate:.0f} msg/sec")
+
+    def test_kafka_dispatcher_dormant_when_telemetry_uninitialized(self):
+        """
+        Verifies that when telemetry is uninitialized/disabled,
+        KafkaDispatcher dispatching (single & batch) performs zero span operations
+        and does not invoke header extraction.
+        """
+        import telemetry
+        from unittest.mock import patch
+
+        telemetry._IS_INITIALIZED = False
+        dispatcher = KafkaDispatcher(DummyConsumer())
+        msg = DummyMessage('test_topic', b'{"id": 1}', headers=[('traceparent', b'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')])
+
+        handled_single = []
+        dispatcher.register_handler('test_topic', lambda t, b: handled_single.append(b), batch=False)
+
+        handled_batch = []
+        dispatcher.register_handler('test_batch_topic', lambda t, b: handled_batch.append(b), batch=True)
+        batch_msg = DummyMessage('test_batch_topic', b'{"id": 2}', headers=[('traceparent', b'00-6cf92f3577b34da6a3ce929d0e0e4799-00f067aa0ba902c8-01')])
+
+        with patch("telemetry.extract_kafka_headers_to_context") as mock_extract:
+            # Single message dispatch
+            dispatcher._handle_message(msg)
+            # Batch message dispatch
+            dispatcher._handle_batch_messages([batch_msg])
+
+            # Handlers must execute successfully
+            self.assertEqual(len(handled_single), 1)
+            self.assertEqual(len(handled_batch), 1)
+
+            # Header extraction MUST NOT be called when disabled
+            mock_extract.assert_not_called()

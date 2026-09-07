@@ -97,7 +97,7 @@ def handle_engine_results(engine_results, kafka_headers=None):
         import telemetry
         from opentelemetry.trace import SpanKind
         tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers)
+        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
     except Exception:
         tracer = None
         extracted_ctx = None
@@ -574,7 +574,7 @@ def handle_rule_hits(rule_hits_json, kafka_headers=None):
         import telemetry
         from opentelemetry.trace import SpanKind
         tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers)
+        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
     except Exception:
         tracer = None
         extracted_ctx = None
@@ -693,7 +693,7 @@ def handle_inventory_event(inventory_json_msg, kafka_headers=None):
         import telemetry
         from opentelemetry.trace import SpanKind
         tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers)
+        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
     except Exception:
         tracer = None
         extracted_ctx = None

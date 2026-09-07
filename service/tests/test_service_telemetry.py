@@ -27,11 +27,16 @@ from service import handle_engine_results, handle_inventory_event
 def in_memory_tracer():
     if not OTEL_AVAILABLE:
         pytest.skip("OpenTelemetry packages not installed yet")
+    import telemetry
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
+        trace._TRACER_PROVIDER_SET_ONCE._done = False
     trace.set_tracer_provider(provider)
-    return exporter
+    telemetry._IS_INITIALIZED = True
+    yield exporter
+    telemetry._IS_INITIALIZED = False
 
 
 def test_engine_results_trace_continuity_in_thread_pool(mocker, in_memory_tracer, sample_engine_results):
@@ -72,17 +77,18 @@ def test_shutdown_telemetry_flushes_spans(mocker):
     if not OTEL_AVAILABLE:
         pytest.skip("OpenTelemetry packages not installed yet")
 
+    import telemetry
     mock_provider = mocker.MagicMock()
     mocker.patch.object(trace, "get_tracer_provider", return_value=mock_provider)
 
-    # Invoke shutdown flush logic
-    if hasattr(mock_provider, "force_flush"):
-        mock_provider.force_flush(timeout_millis=5000)
-    if hasattr(mock_provider, "shutdown"):
-        mock_provider.shutdown()
+    telemetry._IS_INITIALIZED = True
+    telemetry._INITIALIZED_PID = 12345
+    telemetry.shutdown_telemetry(timeout_millis=5000)
 
     mock_provider.force_flush.assert_called_once_with(timeout_millis=5000)
     mock_provider.shutdown.assert_called_once()
+    assert telemetry._IS_INITIALIZED is False
+    assert telemetry._INITIALIZED_PID is None
 
 
 def test_handle_engine_results_throughput_benchmark(mocker, in_memory_tracer, sample_engine_results):
@@ -144,3 +150,27 @@ def test_service_log_formatter_throughput_benchmark():
 
     avg_per_call = duration / iterations
     assert avg_per_call < 0.000025, f"Log formatter too slow: {avg_per_call*1e6:.2f}us/record"
+
+
+def test_service_handlers_dormant_when_telemetry_uninitialized(mocker, sample_engine_results):
+    """
+    Verifies that when telemetry is uninitialized/disabled,
+    service message handlers execute with zero span creation and bypass header extraction.
+    """
+    import telemetry
+
+    telemetry._IS_INITIALIZED = False
+    mock_extract = mocker.patch("telemetry.extract_kafka_headers_to_context")
+    mocker.patch("service.create_db_reports", return_value=True)
+    mocker.patch("service.payload_tracker.payload_status")
+    mock_system_type = mocker.MagicMock()
+    mocker.patch("service.db.SystemType.objects.filter", return_value=mocker.MagicMock(first=mocker.MagicMock(return_value=mock_system_type)))
+
+    headers = [("traceparent", b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")]
+
+    # Execute handler
+    result = handle_engine_results(sample_engine_results, kafka_headers=headers)
+    assert result is True
+
+    # Header extraction MUST NOT be called when disabled
+    mock_extract.assert_not_called()
