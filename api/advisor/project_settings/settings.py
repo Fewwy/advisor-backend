@@ -547,3 +547,9 @@ if KAFKA_SSL_CERT:
     KAFKA_SETTINGS.update({
         'ssl.ca.location': KAFKA_SSL_CERT,
     })
+
+# OpenTelemetry Configuration
+OTEL_ENABLED = os.getenv('OTEL_ENABLED', 'false').lower() in ('true', '1', 'yes', 't')
+OTEL_SERVICE_NAME = os.getenv('OTEL_SERVICE_NAME', 'insights-advisor-api')
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4318')
+OTEL_SAMPLING_RATE = float(os.getenv('OTEL_SAMPLING_RATE', '0.05'))

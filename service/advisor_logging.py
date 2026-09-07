@@ -31,6 +31,11 @@ class AdvisorStreamHandler(logging.StreamHandler):
         self.setFormatter(
             OurFormatter(fmt=json.dumps({"extra": {"component": settings.APP_NAME}}))
         )
+        try:
+            import telemetry
+            self.addFilter(telemetry.OTelContextualFilter())
+        except Exception:
+            pass
 
 
 class OurFormatter(LogstashFormatterV1):

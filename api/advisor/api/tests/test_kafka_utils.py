@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License along
 # with Insights Advisor. If not, see <https://www.gnu.org/licenses/>.
 
-from django.test import TestCase  # , override_settings
+from django.test import SimpleTestCase as TestCase  # , override_settings
 
 from kafka_utils import (
     DummyMessage, DummyConsumer, JsonValue, KafkaDispatcher,
@@ -337,3 +337,132 @@ class TestKafkaUtils(TestCase):
 
         self.assertEqual(consumer.store_offsets_count, 0)
         self.assertEqual(consumer.commit_count, 0)
+
+    def test_prepare_message_preserves_headers(self):
+        """Test that _prepare_message returns (topic, body, headers) without discarding headers."""
+        consumer = DummyConsumer()
+        headers = [('traceparent', b'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')]
+        msg = DummyMessage('test_topic', b'{"key": "val"}', headers=headers)
+
+        dispatcher = KafkaDispatcher(consumer)
+        dispatcher.register_handler('test_topic', lambda t, b: None)
+
+        prepared = dispatcher._prepare_message(msg)
+        self.assertIsNotNone(prepared)
+        topic, body, ret_headers = prepared
+        self.assertEqual(topic, 'test_topic')
+        self.assertEqual(body, {'key': 'val'})
+        self.assertEqual(ret_headers, headers)
+
+    def test_handle_message_trace_propagation(self):
+        """Test that _handle_message creates a CONSUMER span inheriting parent trace context."""
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+            from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        except ImportError:
+            self.skipTest("OpenTelemetry dependencies not installed yet")
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
+            trace._TRACER_PROVIDER_SET_ONCE._done = False
+        trace.set_tracer_provider(provider)
+
+        trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        span_id = "00f067aa0ba902b7"
+        headers = [('traceparent', f"00-{trace_id}-{span_id}-01".encode())]
+        msg = DummyMessage('test_topic', b'{"status": "ok"}', headers=headers)
+
+        handler = DummyHandler('test_handler')
+        dispatcher = KafkaDispatcher(DummyConsumer())
+        dispatcher.register_handler('test_topic', handler)
+        dispatcher._handle_message(msg)
+
+        self.assertEqual(len(handler.handled['test_topic']), 1)
+        spans = exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(format(spans[0].context.trace_id, "032x"), trace_id)
+        self.assertEqual(format(spans[0].parent.span_id, "016x"), span_id)
+
+    def test_handle_batch_messages_span_links(self):
+        """Test that _handle_batch_messages creates a batch span with Links to each message's trace."""
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+            from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        except ImportError:
+            self.skipTest("OpenTelemetry dependencies not installed yet")
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
+            trace._TRACER_PROVIDER_SET_ONCE._done = False
+        trace.set_tracer_provider(provider)
+
+        trace_1 = "4bf92f3577b34da6a3ce929d0e0e4736"
+        trace_2 = "6cf92f3577b34da6a3ce929d0e0e4799"
+        msg1 = DummyMessage('batch_topic', b'{"id": 1}', headers=[('traceparent', f"00-{trace_1}-00f067aa0ba902b7-01".encode())])
+        msg2 = DummyMessage('batch_topic', b'{"id": 2}', headers=[('traceparent', f"00-{trace_2}-00f067aa0ba902c8-01".encode())])
+
+        batch_handler = DummyBatchHandler('batch_handler')
+        dispatcher = KafkaDispatcher(DummyConsumer())
+        dispatcher.register_handler('batch_topic', batch_handler, batch=True)
+        dispatcher._handle_batch_messages([msg1, msg2])
+
+        spans = exporter.get_finished_spans()
+        batch_span = next((s for s in spans if "batch process" in s.name), None)
+        self.assertIsNotNone(batch_span)
+        self.assertEqual(len(batch_span.links), 2)
+        linked_traces = {format(link.context.trace_id, "032x") for link in batch_span.links}
+        self.assertEqual(linked_traces, {trace_1, trace_2})
+
+    def test_prepare_message_throughput_benchmark(self):
+        """Verifies that _prepare_message executes in < 10 microseconds per message over 10,000 calls."""
+        import time
+
+        consumer = DummyConsumer()
+        headers = [('traceparent', b'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')]
+        msg = DummyMessage('bench_topic', b'{"system_id": "123", "data": "test"}', headers=headers)
+
+        dispatcher = KafkaDispatcher(consumer)
+        dispatcher.register_handler('bench_topic', lambda t, b: None)
+
+        iterations = 10000
+        start = time.perf_counter()
+        for _ in range(iterations):
+            dispatcher._prepare_message(msg)
+        duration = time.perf_counter() - start
+
+        avg_per_call = duration / iterations
+        self.assertLess(avg_per_call, 0.000010, f"_prepare_message too slow: {avg_per_call * 1e6:.2f}us/msg")
+
+    def test_batch_dispatch_throughput_with_span_links(self):
+        """Verifies that _handle_batch_messages processes 500 batches of 20 messages in < 2.0 seconds (> 5000 msg/sec)."""
+        import time
+
+        dispatcher = KafkaDispatcher(DummyConsumer())
+        dispatcher.register_handler('throughput_topic', lambda t, b: None, batch=True)
+
+        batch = [
+            DummyMessage(
+                'throughput_topic',
+                f'{{"id": {i}, "name": "host-{i}"}}'.encode(),
+                headers=[('traceparent', b'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')]
+            )
+            for i in range(20)
+        ]
+
+        iterations = 500
+        start = time.perf_counter()
+        for _ in range(iterations):
+            dispatcher._handle_batch_messages(batch)
+        duration = time.perf_counter() - start
+
+        total_messages = iterations * 20
+        rate = total_messages / duration
+        self.assertGreater(rate, 5000, f"Batch dispatch throughput too low: {rate:.0f} msg/sec")

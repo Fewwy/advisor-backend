@@ -483,4 +483,9 @@ class Command(BaseCommand):
         _ = signal.signal(signal.SIGTERM, terminate)
         _ = signal.signal(signal.SIGINT, terminate)
         receiver.receive(batch_size=settings.INVENTORY_BATCH_SIZE)
+        try:
+            import telemetry
+            telemetry.shutdown_telemetry()
+        except Exception:
+            pass
         logger.info('Advisor Inventory replication service shutting down')

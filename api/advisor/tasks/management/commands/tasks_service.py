@@ -627,4 +627,9 @@ class Command(BaseCommand):
         # Loops until receiver.quit is set
         logger.info("Starting tasks service loop ...")
         receiver.receive()
+        try:
+            import telemetry
+            telemetry.shutdown_telemetry()
+        except Exception:
+            pass
         logger.info('Tasks service shutting down ...')
