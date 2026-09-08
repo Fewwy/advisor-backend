@@ -28,6 +28,7 @@ https://docs.djangoproject.com/en/2.0/ref/settings/
 
 import os
 import importlib
+import importlib.util
 import sys
 
 from prometheus_client import Info
@@ -36,7 +37,7 @@ from app_common_python import LoadedConfig, KafkaTopics, KafkaServers
 
 
 def string_to_bool(s):
-    return s.lower() in ("yes", "true", "t", "1")
+    return bool(s) and str(s).strip().lower() in ("yes", "true", "t", "1")
 
 
 # Define the APP_NAME

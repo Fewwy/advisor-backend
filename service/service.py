@@ -38,6 +38,7 @@ import prometheus
 import reports as report_hooks
 import utils
 import build_info
+import telemetry
 
 # Setup Django database models
 import django
@@ -93,30 +94,7 @@ def handle_engine_results(engine_results, kafka_headers=None):
     Handle all engine results received from the shared engine instance
     This comes in on platform.engine.results
     """
-    try:
-        import telemetry
-        from opentelemetry.trace import SpanKind
-        tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
-    except Exception:
-        tracer = None
-        extracted_ctx = None
-
-    span_cm = (
-        tracer.start_as_current_span(
-            "platform.engine.results process",
-            context=extracted_ctx,
-            kind=SpanKind.CONSUMER,
-            attributes={
-                "messaging.system": "kafka",
-                "messaging.destination.name": ENGINE_RESULTS_TOPIC,
-                "messaging.operation": "process",
-            }
-        )
-        if tracer else None
-    )
-
-    def _execute():
+    with telemetry.kafka_consumer_span(ENGINE_RESULTS_TOPIC, kafka_headers):
         # Clean threading cruft and start function metrics
         utils.clean_threading_cruft()
         engine_results_started = time.time()
@@ -240,11 +218,6 @@ def handle_engine_results(engine_results, kafka_headers=None):
             payload_tracker.payload_status('error', 'Failure processing engine results.')
             logger.error('Failure processing engine results.')
             return False
-
-    if span_cm:
-        with span_cm:
-            return _execute()
-    return _execute()
 
 
 @prometheus.INSIGHTS_ADVISOR_SERVICE_DB_ELAPSED.time()
@@ -570,30 +543,7 @@ def create_db_reports(
 
 @prometheus.INSIGHTS_ADVISOR_SERVICE_RULE_HITS_ELAPSED.time()
 def handle_rule_hits(rule_hits_json, kafka_headers=None):
-    try:
-        import telemetry
-        from opentelemetry.trace import SpanKind
-        tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
-    except Exception:
-        tracer = None
-        extracted_ctx = None
-
-    span_cm = (
-        tracer.start_as_current_span(
-            "platform.insights.rule-hits process",
-            context=extracted_ctx,
-            kind=SpanKind.CONSUMER,
-            attributes={
-                "messaging.system": "kafka",
-                "messaging.destination.name": RULE_HITS_TOPIC,
-                "messaging.operation": "process",
-            }
-        )
-        if tracer else None
-    )
-
-    def _execute():
+    with telemetry.kafka_consumer_span(RULE_HITS_TOPIC, kafka_headers):
         utils.clean_threading_cruft()
 
         rule_hits_started = time.time()
@@ -681,38 +631,10 @@ def handle_rule_hits(rule_hits_json, kafka_headers=None):
             logger.error("Error processing third party rule hits.", extra=extra_info)
         return True
 
-    if span_cm:
-        with span_cm:
-            return _execute()
-    return _execute()
-
 
 @prometheus.INSIGHTS_ADVISOR_SERVICE_INVENTORY_EVENTS_ELAPSED.time()
 def handle_inventory_event(inventory_json_msg, kafka_headers=None):
-    try:
-        import telemetry
-        from opentelemetry.trace import SpanKind
-        tracer = telemetry.get_tracer("advisor-service")
-        extracted_ctx = telemetry.extract_kafka_headers_to_context(kafka_headers) if tracer else None
-    except Exception:
-        tracer = None
-        extracted_ctx = None
-
-    span_cm = (
-        tracer.start_as_current_span(
-            "platform.inventory.events process",
-            context=extracted_ctx,
-            kind=SpanKind.CONSUMER,
-            attributes={
-                "messaging.system": "kafka",
-                "messaging.destination.name": INVENTORY_EVENTS_TOPIC,
-                "messaging.operation": "process",
-            }
-        )
-        if tracer else None
-    )
-
-    def _execute():
+    with telemetry.kafka_consumer_span(INVENTORY_EVENTS_TOPIC, kafka_headers):
         # clean any old thread cruft and start the timer
         utils.clean_threading_cruft()
         inventory_event_started = time.time()
@@ -844,11 +766,6 @@ def handle_inventory_event(inventory_json_msg, kafka_headers=None):
             success_msg = f"Succesfully DELETED records for {inventory_id} in account {account} org_id {org_id}."
             inventory_event_success(success_msg, payload_info)
 
-    if span_cm:
-        with span_cm:
-            return _execute()
-    return _execute()
-
     # We currently do nothing for updated events
     # Leaving as a placeholder so we know 'updated' events do still come in
     # if event_type == 'updated':
@@ -856,7 +773,6 @@ def handle_inventory_event(inventory_json_msg, kafka_headers=None):
 
 def start():
     try:
-        import telemetry
         telemetry.init_telemetry(service_name="insights-advisor-service")
     except Exception as e:
         logger.warning("Error initializing telemetry in service: %s", e)
@@ -978,7 +894,6 @@ def start():
     # Close consumer connection
     c.close()
     try:
-        import telemetry
         telemetry.shutdown_telemetry()
     except Exception:
         pass

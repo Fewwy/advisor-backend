@@ -18,23 +18,47 @@ except ImportError:
 
 class TestTelemetryBase(SimpleTestCase):
     def test_string_to_bool(self):
+        # Standard truthy strings
         self.assertTrue(telemetry.string_to_bool("true"))
         self.assertTrue(telemetry.string_to_bool("True"))
+        self.assertTrue(telemetry.string_to_bool("TRUE"))
         self.assertTrue(telemetry.string_to_bool("1"))
         self.assertTrue(telemetry.string_to_bool("yes"))
+        self.assertTrue(telemetry.string_to_bool("YES"))
         self.assertTrue(telemetry.string_to_bool("t"))
+        self.assertTrue(telemetry.string_to_bool("T"))
+        # Whitespace-padded truthy strings
+        self.assertTrue(telemetry.string_to_bool("  true  "))
+        self.assertTrue(telemetry.string_to_bool(" 1 "))
+
+        # Standard falsy strings
         self.assertFalse(telemetry.string_to_bool("false"))
+        self.assertFalse(telemetry.string_to_bool("False"))
+        self.assertFalse(telemetry.string_to_bool("FALSE"))
         self.assertFalse(telemetry.string_to_bool("0"))
+        self.assertFalse(telemetry.string_to_bool("no"))
+        self.assertFalse(telemetry.string_to_bool("NO"))
+        self.assertFalse(telemetry.string_to_bool("f"))
+        self.assertFalse(telemetry.string_to_bool("F"))
+        # Whitespace-padded falsy strings
+        self.assertFalse(telemetry.string_to_bool("  false  "))
+        self.assertFalse(telemetry.string_to_bool(" 0 "))
+
+        # Edge cases (None, empty, non-boolean words)
         self.assertFalse(telemetry.string_to_bool(None))
         self.assertFalse(telemetry.string_to_bool(""))
+        self.assertFalse(telemetry.string_to_bool("   "))
+        self.assertFalse(telemetry.string_to_bool("disabled"))
+        self.assertFalse(telemetry.string_to_bool("unknown"))
 
     def test_extract_kafka_headers_to_context_empty(self):
+        """Issue 08: When headers are missing or empty, returns None so ambient context is inherited."""
         if not OTEL_AVAILABLE:
             self.skipTest("OpenTelemetry packages not installed yet")
         ctx = telemetry.extract_kafka_headers_to_context(None)
-        self.assertIsNotNone(ctx)
+        self.assertIsNone(ctx)
         ctx_empty = telemetry.extract_kafka_headers_to_context([])
-        self.assertIsNotNone(ctx_empty)
+        self.assertIsNone(ctx_empty)
 
     def test_extract_kafka_headers_to_context_with_traceparent(self):
         if not OTEL_AVAILABLE:
@@ -349,6 +373,37 @@ class TestDjangoAndGunicornInstrumentation(SimpleTestCase):
             gunicorn_conf.child_exit(server, worker)
             mock_shutdown_telemetry.assert_called_once()
 
+    def test_wsgi_skips_init_when_gunicorn_imported(self):
+        """Issue 01: under gunicorn (--preload) the master must NOT initialize
+        telemetry at import time; post_fork does it per-worker."""
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        with patch.dict(sys.modules, {"gunicorn": MagicMock()}), \
+             patch("django.core.wsgi.get_wsgi_application", return_value=MagicMock()), \
+             patch("telemetry.init_telemetry") as mock_init_telemetry:
+            import importlib
+            import project_settings.wsgi as wsgi_mod
+            mock_init_telemetry.reset_mock()
+            importlib.reload(wsgi_mod)
+            mock_init_telemetry.assert_not_called()
+
+    def test_wsgi_initializes_telemetry_for_non_gunicorn(self):
+        """Issue 01: for non-gunicorn runtimes (e.g. manage.py runserver),
+        wsgi.py must initialize telemetry at import time."""
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        with patch.dict(sys.modules):
+            sys.modules.pop("gunicorn", None)
+            with patch("django.core.wsgi.get_wsgi_application", return_value=MagicMock()), \
+                 patch("telemetry.init_telemetry") as mock_init_telemetry:
+                import importlib
+                import project_settings.wsgi as wsgi_mod
+                mock_init_telemetry.reset_mock()
+                importlib.reload(wsgi_mod)
+                mock_init_telemetry.assert_called_once_with(service_name="insights-advisor-api")
+
 
 class TestTelemetryPerformanceAndOptimization(SimpleTestCase):
     """
@@ -478,15 +533,100 @@ class TestTelemetryPerformanceAndOptimization(SimpleTestCase):
         self.assertLess(scaling_ratio, 25.0, f"Non-linear scaling detected: {scaling_ratio:.2f}x for 10x data")
 
 
+class TestKafkaConsumerSpanContextManagers(SimpleTestCase):
+    """
+    Direct unit tests for the kafka_consumer_span and kafka_batch_consumer_span
+    context managers introduced in telemetry.py (Issue 03 & 04).
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not OTEL_AVAILABLE:
+            self.skipTest("OpenTelemetry packages not installed yet")
+        self.exporter = InMemorySpanExporter()
+        self.provider = TracerProvider()
+        self.provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+
+    def test_kafka_consumer_span_when_disabled(self):
+        """Verifies that when telemetry is uninitialized, kafka_consumer_span yields None and executes body."""
+        telemetry._IS_INITIALIZED = False
+        executed = False
+        with telemetry.kafka_consumer_span("test.topic", None) as span:
+            executed = True
+            self.assertIsNone(span)
+        self.assertTrue(executed)
+
+    def test_kafka_consumer_span_when_enabled(self):
+        """Verifies that kafka_consumer_span creates a CONSUMER span with messaging attributes and parent context."""
+        from unittest.mock import patch
+        from opentelemetry.trace import SpanKind
+
+        trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        span_id = "00f067aa0ba902b7"
+        headers = [("traceparent", f"00-{trace_id}-{span_id}-01".encode())]
+
+        tracer = self.provider.get_tracer("advisor-service")
+        with patch("telemetry.get_tracer", return_value=tracer):
+            with telemetry.kafka_consumer_span("platform.engine.results", headers) as span:
+                self.assertIsNotNone(span)
+
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        span = spans[0]
+        self.assertEqual(span.name, "platform.engine.results process")
+        self.assertEqual(span.kind, SpanKind.CONSUMER)
+        self.assertEqual(span.attributes.get("messaging.system"), "kafka")
+        self.assertEqual(span.attributes.get("messaging.destination.name"), "platform.engine.results")
+        self.assertEqual(span.attributes.get("messaging.operation"), "process")
+        self.assertEqual(format(span.context.trace_id, "032x"), trace_id)
+        self.assertEqual(format(span.parent.span_id, "016x"), span_id)
+
+    def test_kafka_batch_consumer_span_when_disabled(self):
+        """Verifies that when telemetry is uninitialized, kafka_batch_consumer_span yields None and executes body."""
+        telemetry._IS_INITIALIZED = False
+        executed = False
+        with telemetry.kafka_batch_consumer_span("test.batch.topic", None, message_count=5) as span:
+            executed = True
+            self.assertIsNone(span)
+        self.assertTrue(executed)
+
+    def test_kafka_batch_consumer_span_when_enabled(self):
+        """Verifies that kafka_batch_consumer_span creates a batch span with trace links and message count."""
+        from unittest.mock import patch
+        from opentelemetry.trace import SpanKind
+
+        trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        span_id = "00f067aa0ba902b7"
+        headers_list = [[("traceparent", f"00-{trace_id}-{span_id}-01".encode())], []]
+
+        tracer = self.provider.get_tracer("advisor-kafka")
+        with patch("telemetry.get_tracer", return_value=tracer):
+            with telemetry.kafka_batch_consumer_span("platform.inventory.events", headers_list=headers_list, message_count=2) as span:
+                self.assertIsNotNone(span)
+
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        span = spans[0]
+        self.assertEqual(span.name, "platform.inventory.events batch process")
+        self.assertEqual(span.kind, SpanKind.CONSUMER)
+        self.assertEqual(span.attributes.get("messaging.system"), "kafka")
+        self.assertEqual(span.attributes.get("messaging.destination.name"), "platform.inventory.events")
+        self.assertEqual(span.attributes.get("messaging.batch.message_count"), 2)
+        self.assertEqual(len(span.links), 1)
+        self.assertEqual(format(span.links[0].context.trace_id, "032x"), trace_id)
+        self.assertEqual(format(span.links[0].context.span_id, "016x"), span_id)
+
+
 class TestReviewCommentsIssues(SimpleTestCase):
     """
     Test suite reproducing the four review comment findings.
     """
 
-    def test_comment1_init_telemetry_force_reinit_replaces_provider(self):
+    def test_comment1_init_telemetry_sets_provider_once_per_process(self):
         """
-        Comment 1: Verifies that init_telemetry(force_reinit=True) successfully
-        overrides the TracerProvider across process forks without being blocked.
+        Comment 1 (Issue 01): init_telemetry sets the TracerProvider exactly once
+        per process without the _TRACER_PROVIDER_SET_ONCE hack. Under gunicorn (--preload),
+        the master skips init (wsgi.py guard) and workers initialize once in post_fork.
         """
         if not OTEL_AVAILABLE:
             self.skipTest("OpenTelemetry packages not installed yet")
@@ -499,8 +639,8 @@ class TestReviewCommentsIssues(SimpleTestCase):
         telemetry.init_telemetry(service_name="second-service", force_reinit=True)
         second_provider = trace.get_tracer_provider()
 
-        # Must successfully replace the provider instance
-        self.assertIsNot(first_provider, second_provider)
+        # Same-process re-init does NOT replace the provider (hack removed)
+        self.assertIs(first_provider, second_provider)
 
     def test_comment2_shutdown_telemetry_invokes_provider_methods(self):
         """

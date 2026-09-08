@@ -10,21 +10,17 @@ Follows HBI and Puptoo architecture adapted for Django and Confluent Kafka.
 
 import os
 import logging
+from contextlib import contextmanager
 from typing import Optional
 from urllib.parse import urlparse
 
 import thread_storage
+from project_settings.settings import string_to_bool
 
 logger = logging.getLogger("advisor-telemetry")
 
 _INITIALIZED_PID: Optional[int] = None
 _IS_INITIALIZED = False
-
-
-def string_to_bool(value: Optional[str]) -> bool:
-    if not value:
-        return False
-    return value.strip().lower() in ("true", "1", "yes", "t")
 
 
 try:
@@ -46,8 +42,8 @@ try:
             if not span.is_recording():
                 return
 
-            # 1. Set service identifier
-            span.set_attribute("rh.service", self.service_name)
+            # 1. Set Red Hat standard service identifier
+            span.set_attribute("rh.service", "advisor")
 
             # 2. Extract org_id and request_id with precedence: Baggage -> thread_storage -> Request META
             org_id = None
@@ -99,7 +95,6 @@ class OTelContextualFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            from opentelemetry import trace
             span = trace.get_current_span()
             span_context = span.get_span_context() if span else None
 
@@ -209,7 +204,7 @@ def init_telemetry(
     )
 
     provider = TracerProvider(resource=resource, sampler=sampler, span_limits=span_limits)
-    provider.add_span_processor(RHAttributeSpanProcessor(service_name=resolved_service_name))
+    provider.add_span_processor(RHAttributeSpanProcessor())
 
     compression_map = {"gzip": Compression.Gzip, "deflate": Compression.Deflate}
     compression = compression_map.get(
@@ -229,8 +224,6 @@ def init_telemetry(
         export_timeout_millis=int(os.getenv("OTEL_BSP_EXPORT_TIMEOUT", "10000")),
     )
     provider.add_span_processor(bsp)
-    if hasattr(trace, "_TRACER_PROVIDER_SET_ONCE"):
-        trace._TRACER_PROVIDER_SET_ONCE._done = False
     trace.set_tracer_provider(provider)
 
     try:
@@ -274,11 +267,11 @@ def get_tracer(name: str = "advisor"):
 
 
 def extract_kafka_headers_to_context(headers: Optional[list[tuple[str, bytes]]]):
-    """Extract W3C trace context from Kafka message headers."""
+    """Extract W3C trace context from Kafka message headers. Returns None if headers are absent."""
+    if not headers:
+        return None
     try:
-        from opentelemetry import propagate, trace
-        if not headers:
-            return trace.Context()
+        from opentelemetry import propagate
         carrier = {}
         for key, val in headers:
             if isinstance(val, bytes):
@@ -286,8 +279,85 @@ def extract_kafka_headers_to_context(headers: Optional[list[tuple[str, bytes]]])
             elif isinstance(val, str):
                 carrier[key] = val
         return propagate.extract(carrier)
-    except ImportError:
+    except Exception:
         return None
+
+
+@contextmanager
+def kafka_consumer_span(topic: str, kafka_headers=None, tracer_name: str = "advisor-service"):
+    """
+    Standard OpenTelemetry Messaging CONSUMER span wrapper for Kafka message processing.
+    Extracts W3C trace context from Kafka headers, sets semantic convention attributes,
+    and no-ops cleanly if OpenTelemetry is uninitialized or disabled.
+    """
+    tracer = get_tracer(tracer_name)
+    if not tracer:
+        yield None
+        return
+
+    try:
+        from opentelemetry.trace import SpanKind
+        extracted_ctx = extract_kafka_headers_to_context(kafka_headers)
+    except Exception:
+        yield None
+        return
+
+    span_name = f"{topic} process"
+    attributes = {
+        "messaging.system": "kafka",
+        "messaging.destination.name": topic,
+        "messaging.operation": "process",
+    }
+    with tracer.start_as_current_span(
+        span_name,
+        context=extracted_ctx,
+        kind=SpanKind.CONSUMER,
+        attributes=attributes,
+    ) as span:
+        yield span
+
+
+@contextmanager
+def kafka_batch_consumer_span(topic: str, headers_list=None, message_count: int = 0, tracer_name: str = "advisor-kafka"):
+    """
+    Standard OpenTelemetry Messaging CONSUMER span wrapper for Kafka batch message processing.
+    Creates trace links to each message's upstream trace context according to OTel batch specs.
+    """
+    tracer = get_tracer(tracer_name)
+    if not tracer:
+        yield None
+        return
+
+    links = []
+    try:
+        from opentelemetry import trace
+        from opentelemetry.trace import SpanKind
+        if headers_list:
+            for h in headers_list:
+                if h:
+                    ctx = extract_kafka_headers_to_context(h)
+                    if ctx:
+                        span_ctx = trace.get_current_span(ctx).get_span_context()
+                        if span_ctx.is_valid:
+                            links.append(trace.Link(span_ctx))
+    except Exception:
+        yield None
+        return
+
+    span_name = f"{topic} batch process"
+    attributes = {
+        "messaging.system": "kafka",
+        "messaging.destination.name": topic,
+        "messaging.operation": "process",
+        "messaging.batch.message_count": message_count,
+    }
+    with tracer.start_as_current_span(
+        span_name,
+        kind=SpanKind.CONSUMER,
+        links=links,
+        attributes=attributes,
+    ) as span:
+        yield span
 
 
 def shutdown_telemetry(timeout_millis: int = 5000) -> None:
